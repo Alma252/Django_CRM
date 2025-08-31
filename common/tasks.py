@@ -1,5 +1,5 @@
 import datetime
-
+import logging
 from celery import Celery
 from django.conf import settings
 from django.contrib.auth.tokens import default_token_generator
@@ -8,122 +8,113 @@ from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
-
+from django.conf import settings
 from common.models import Comment, Profile, User
 from common.token_generator import account_activation_token
 
+logger = logging.getLogger(__name__)
+
 app = Celery("redis://")
 
-
-@app.task
+@shared_task
 def send_email_to_new_user(user_id):
+    """Send activation email to newly registered users."""
 
-    """Send Mail To Users When their account is created"""
-    user_obj = User.objects.filter(id=user_id).first()
+    user = User.objects.filter(id=user_id).first()
+    if not user:
+        logger.warning(f"send_email_to_new_user: No user found with id={user_id}")
+        return
 
-    if user_obj:
-        context = {}
-        user_email = user_obj.email
-        context["url"] = settings.DOMAIN_NAME
-        context["uid"] = (urlsafe_base64_encode(force_bytes(user_obj.pk)),)
-        context["token"] = account_activation_token.make_token(user_obj)
-        time_delta_two_hours = datetime.datetime.strftime(
-            timezone.now() + datetime.timedelta(hours=2), "%Y-%m-%d-%H-%M-%S"
+    try:
+        # Generate activation data
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        token = account_activation_token.make_token(user)
+        expires_at = timezone.now() + datetime.timedelta(hours=2)
+
+        # Save activation info in DB
+        user.activation_key = token
+        user.key_expires = expires_at
+        user.save()
+
+        # Build activation link
+        complete_url = (
+            f"{settings.DOMAIN_NAME}/auth/activate-user/{uid}/{token}/"
         )
-        # creating an activation token and saving it in user model
-        activation_key = context["token"] + time_delta_two_hours
-        user_obj.activation_key = activation_key
-        user_obj.save()
 
-        context["complete_url"] = context[
-            "url"
-        ] + "/auth/activate-user/{}/{}/{}/".format(
-            context["uid"][0],
-            context["token"],
-            activation_key,
-        )
-        recipients = [
-            user_email,
-        ]
+        # Prepare context for email template
+        context = {
+            "url": settings.DOMAIN_NAME,
+            "uid": uid,
+            "token": token,
+            "activation_key": user.activation_key,
+            "complete_url": complete_url,
+            "expires_at": expires_at,
+        }
+
+        # Render email
         subject = "Welcome to Bottle CRM"
-        html_content = render_to_string("user_status_in.html", context=context)
-
+        html_content = render_to_string("user_status_in.html", context)
         msg = EmailMessage(
             subject,
             html_content,
             from_email=settings.DEFAULT_FROM_EMAIL,
-            to=recipients,
+            to=[user.email],
+        )
+        msg.content_subtype = "html"
+        msg.send()
+
+        logger.info(f"Activation email sent to {user.email}")
+
+    except Exception as e:
+        logger.error(f"Failed to send activation email to {user.email}: {e}")
+
+
+@shared_task
+def send_email_user_mentions(comment_id, called_from):
+    comment = Comment.objects.filter(id=comment_id).first()
+    if not comment:
+        return
+    mentioned_usernames = {
+        word.strip("@").strip(",")
+        for word in comment.comment.split()
+        if word.startswith("@")
+
+    }
+    users = User.objects.filter(username_in=mentioned_usernames, is_active=True)
+    recipients = [user.email for user in users]
+
+    subject_map = {
+        "accounts": "New comment on Account.",
+        "contacts": "New comment on Contact.",
+        "leads": "New comment on Lead.",
+        "opportunity": "New comment on Opportunity.",
+        "cases": "New comment on Case.",
+        "tasks": "New comment on Task.",
+        "invoices": "New comment on Invoice.",
+        "events": "New comment on Event.",
+    }
+
+    subject = subject_map.get(called_from, "New comment.")
+
+    context = {
+        "commented_by": comment.commented_by,
+        "comment_description": comment.comment,
+        "url": settings.DOMAIN_NAME,
+    }
+
+    for user in users:
+        context["mentioned_user"] = user.username
+        html_content = render_to_string("comment_email.html", context)
+        msg = EmailMessage(
+            subject,
+            html_content,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[user.email],
         )
         msg.content_subtype = "html"
         msg.send()
 
 
-@app.task
-def send_email_user_mentions(
-    comment_id,
-    called_from,
-):
-    """Send Mail To Mentioned Users In The Comment"""
-    comment = Comment.objects.filter(id=comment_id).first()
-    if comment:
-        comment_text = comment.comment
-        comment_text_list = comment_text.split()
-        recipients = []
-        for comment_text in comment_text_list:
-            if comment_text.startswith("@"):
-                if comment_text.strip("@").strip(",") not in recipients:
-                    if User.objects.filter(
-                        username=comment_text.strip("@").strip(","), is_active=True
-                    ).exists():
-                        email = (
-                            User.objects.filter(
-                                username=comment_text.strip("@").strip(",")
-                            )
-                            .first()
-                            .email
-                        )
-                        recipients.append(email)
-
-        context = {}
-        context["commented_by"] = comment.commented_by
-        context["comment_description"] = comment.comment
-        subject = None
-        if called_from == "accounts":
-            subject = "New comment on Account. "
-        elif called_from == "contacts":
-            subject = "New comment on Contact. "
-        elif called_from == "leads":
-            subject = "New comment on Lead. "
-        elif called_from == "opportunity":
-            subject = "New comment on Opportunity. "
-        elif called_from == "cases":
-            subject = "New comment on Case. "
-        elif called_from == "tasks":
-            subject = "New comment on Task. "
-        elif called_from == "invoices":
-            subject = "New comment on Invoice. "
-        elif called_from == "events":
-            subject = "New comment on Event. "
-        if subject:
-            context["url"] = settings.DOMAIN_NAME
-        else:
-            context["url"] = ""
-        # subject = 'Django CRM : comment '
-        if recipients:
-            for recipient in recipients:
-                recipients_list = [
-                    recipient,
-                ]
-                context["mentioned_user"] = recipient
-                html_content = render_to_string("comment_email.html", context=context)
-                msg = EmailMessage(
-                    subject,
-                    html_content,
-                    from_email=settings.DEFAULT_FROM_EMAIL,
-                    to=recipients_list,
-                )
-                msg.content_subtype = "html"
-                msg.send()
 
 
 @app.task
